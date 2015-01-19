@@ -1,8 +1,8 @@
 MKFILE		= Makefile
 
-NVCC		= nvcc -O3 -lstdc++ -rdc=true -gencode arch=compute_50,code=sm_50
+NVCC		= nvcc -O3 -lstdc++ -lcudadevrt -rdc=true -gencode arch=compute_50,code=sm_50 -maxrregcount 32
 
-CUSOURCE	= main.cu domain.cu peano.cu tetra.cu hash.cu
+CUSOURCE	= main.cu domain.cu peano.cu assoc.cu hash.cu tetra.cu
 CUHEADER	= structures.h predicates.h GDelShewchukDevice.h 
 
 CUOBJECTS	= ${CUSOURCE:.cu=.o}
