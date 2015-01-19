@@ -4,6 +4,7 @@
     All of this code is published by Volker Springel and is
     available online. He is credited for the Peano-hashing
 */
+
 __device__
 static int quadrants[24][2][2][2] = 
 {
@@ -99,4 +100,44 @@ unsigned long peano_hilbert_key(float x, float y, float z, int bits)
     }
 
     return key;
+}
+
+__global__
+void peanohash(const int            num_cartesian_points,
+               const point         *points,
+                     unsigned long *peanokeys)
+{
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    for (int tid = thread_id; tid < num_cartesian_points; tid += bpg * tpb)
+    {
+        const point p = points[tid + 4];
+
+        peanokeys[tid] = peano_hilbert_key(p.x, p.y, p.z, sizeof(p.x));
+        //printf("%lu\n", peanokeys[tid]);
+    }
+}
+
+void regulus::sort_domain_by_peanokey(void)
+{
+    thrust::device_ptr<unsigned long> peanokeys =
+        thrust::device_malloc<unsigned long>(num_cartesian_points);
+
+    peanohash<<<bpg, tpb>>>(num_cartesian_points, 
+                            points.get(), 
+                            peanokeys.get());
+
+    thrust::sort_by_key(peanokeys,
+                        peanokeys + num_cartesian_points,
+                        points + 4);
+
+    cudaDeviceSynchronize();
+
+/*    for (int i = 0; i < num_points; ++i)
+    {
+        point p = points[i];
+        p.print();
+    }*/
+
+    thrust::device_free(peanokeys);
 }
