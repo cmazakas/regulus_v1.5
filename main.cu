@@ -8,8 +8,6 @@ int main(int argc, char **argv)
         return 1;
     }
     
-    int box_length = 0;
-
     char *end = 0;
     long int status = strtol(argv[1], &end, 10);
     if (status == 0L || status == LONG_MIN || status == LONG_MAX)
@@ -18,14 +16,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    box_length = status;
+    const int box_length = status;
 
-    /* ----------------------------- */
+    regulus reg(box_length);
 
-    mesh m;
-    m.create_input(box_length); // generate Cartesian set
-    m.sort_by_peanokey(); // sort points by spatial locality
-    m.triangulate(); // triangulate the point set
+    reg.triangulate();
 
     return 0;
 }
