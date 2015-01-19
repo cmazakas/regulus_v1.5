@@ -1,136 +1,195 @@
 #include <stdio.h>
 #include <assert.h>
+
 #include <iostream>
-#include <stdlib.h>
+#include <iomanip>
 
-#include <thrust/host_vector.h>
 #include <thrust/device_vector.h>
+#include <thrust/host_vector.h>
 #include <thrust/sort.h>
-#include <thrust/scan.h>
-#include <thrust/functional.h>
-#include <thrust/remove.h>
 #include <thrust/device_ptr.h>
+#include <thrust/unique.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/tuple.h>
+#include <thrust/iterator/transform_iterator.h>
+#include <thrust/copy.h>
+#include <thrust/sequence.h>
+#include <thrust/execution_policy.h>
+#include <thrust/count.h>
+#include <thrust/find.h>
+#include <thrust/device_malloc.h>
+#include <thrust/device_free.h>
+#include <thrust/fill.h>
 
-typedef float real;
+const int bpg = 512;
+const int tpb = 256;
 
-const int tpb = 256; // threads per block
-const int bpg = 512; // blocks per grid
+/*
+    This is the basic point structure for Regulus.
+
+    The use of a union between an array and a struct
+    is a tad sketchy. I do a cross-platform check with
+    the constructor. If it fails then that's all my fault.
+
+    Only works if compiler keeps size at 12 bytes
+*/
 
 struct point
 {
-    // Use a union as hybrid storage
-
     union
     {
+        float p[3];
+
         struct
         {
-            real x, y, z;
+            float x, y, z;
         };
-
-        real p[3];
     };
 
     __host__ __device__
-    point(real a, real b, real c) : x(a), y(b), z(c) { };
+    point(void)
+    {
+        assert(&x == p && &y == p + 1 && &z == p + 2);
+
+        x = y = z = 0;
+    };
+
+    __host__ __device__
+    point(float a, float b, float c)
+    {
+        assert((&x == p) && (&y == p + 1) && (&z == p + 2));
+
+        x = a;
+        y = b;
+        z = c;
+    };
 
     __host__ __device__
     void print(void) const
     {
-        printf("(%.00f, %.00f, %.00f)\n", x, y, z);
-    };
+        printf("%.00f, %.00f, %.00f\n", x, y, z);
+    }
 };
 
 struct tetrahedron
 {
-    int v[4]; // list of vertices in point buffer
+    int v[4];
 
     __host__ __device__
-    tetrahedron(int v0, int v1, int v2, int v3)
+    tetrahedron(void)
     {
-        v[0] = v0; v[1] = v1; v[2] = v2; v[3] = v3;
+        v[0] = v[1] = v[2] = v[3] = -1;
     };
+
+    __host__ __device__
+    tetrahedron(const int a, 
+                const int b, 
+                const int c, 
+                const int d)
+    {
+        v[0] = a;
+        v[1] = b;
+        v[2] = c;
+        v[3] = d;
+    };
+
+    __host__ __device__
+    void print(void) const
+    {
+        printf("%d, %d, %d, %d\n", v[0], v[1], v[2], v[3]);
+    }
 };
 
 struct adjacency_info
 {
-    int ngb[4]; // list of neighbour indices in tetra buffer
-
-    __host__ __device__
-    adjacency_info(int ngb0, int ngb1, int ngb2, int ngb3)
-    {
-        ngb[0] = ngb0; ngb[1] = ngb1; ngb[2] = ngb2; ngb[3] = ngb3;
-    };
+    int ngb[4];
 
     __host__ __device__
     adjacency_info(void)
     {
-        ngb[3] = ngb[2] = ngb[1] = ngb[0] = -1;
+        ngb[0] = ngb[1] = ngb[2] = ngb[3] = -1;
+    }; 
+
+    __host__ __device__
+    adjacency_info(const int a, 
+                   const int b, 
+                   const int c, 
+                   const int d)
+    {
+        ngb[0] = a;
+        ngb[1] = b;
+        ngb[2] = c;
+        ngb[3] = d;
     };
 };
 
-struct mesh
+struct associated_arrays
 {
-    point          *points;
-    tetrahedron    *tetrahedra;
-    adjacency_info *adjacency_relations;
+    int size, capacity;
 
-    int             num_points; // number of points
-    int             num_tetrahedra; // number of tetrahedra
+    // These are the 4 main arrays of regulus
+    // pa[i] = point in points array
+    // ta[i] = id of tetra containing pa[i]
+    // la[i] = location code of pa[i] relative to ta[i]
+    // fs[i] = fracture size of pa[i] wrt to ta[i]
 
-    /* --------------------------------------------------- */
+    thrust::device_ptr<int> pa, ta, fs, la, nominated;
 
-    void create_input(int box_length); // initiation routine
-    void sort_by_peanokey(void); // hash sorting routine
+    associated_arrays(const int num_cartesian_points);
+    ~associated_arrays(void);
 
-    void triangulate(void); // mesh generation routine
+    void resize(const int N);
+    void print(void) const;
+    void print_with_nominated(void) const;
+};
 
-    ~mesh(void)
+struct hash_table
+{
+    int num_keys,
+        num_buckets;
+
+    //const int *bucket_contents,
+              //*which_bucket;
+          //int *bucket_starts;
+
+    thrust::device_ptr<int> bucket_contents,
+                            which_bucket,
+                            bucket_starts;
+
+    hash_table(const int                     Num_keys,
+               const int                     Num_buckets,
+               const thrust::device_ptr<int> Bucket_contents,
+               const thrust::device_ptr<int> Which_bucket);
+
+    ~hash_table(void);
+
+    void build_table(void);
+};
+
+struct regulus
+{
+    thrust::device_ptr<point>          points;
+    thrust::device_ptr<tetrahedron>    mesh;
+    thrust::device_ptr<adjacency_info> adj_relations;
+
+    int num_cartesian_points,
+        num_points,
+        num_tetra;
+
+    void build_domain(const int box_length);
+    void sort_domain_by_peanokey(void);
+    void triangulate(void);
+
+    regulus(const int box_length)
     {
-        if (points)
-        {
-            printf("Freeing points...\n");
-            cudaFree(points);
-        }
+        build_domain(box_length);
+        sort_domain_by_peanokey();
+    };
 
-        if (tetrahedra)
-        {
-            printf("Freeing mesh...\n");
-            cudaFree(tetrahedra);
-        }
-
-        if (adjacency_relations)
-        {
-            printf("Freeing adjacency information...\n");
-            cudaFree(adjacency_relations);
-        }
-    }
+    ~regulus(void)
+    {
+        thrust::device_free(points);
+        thrust::device_free(mesh);
+        thrust::device_free(adj_relations);
+    };
 };
-
-static const unsigned char BitReverseTable256[] = 
-{
-  0x00, 0x80, 0x40, 0xC0, 0x20, 0xA0, 0x60, 0xE0, 0x10, 0x90, 0x50, 0xD0, 0x30, 0xB0, 0x70, 0xF0, 
-  0x08, 0x88, 0x48, 0xC8, 0x28, 0xA8, 0x68, 0xE8, 0x18, 0x98, 0x58, 0xD8, 0x38, 0xB8, 0x78, 0xF8, 
-  0x04, 0x84, 0x44, 0xC4, 0x24, 0xA4, 0x64, 0xE4, 0x14, 0x94, 0x54, 0xD4, 0x34, 0xB4, 0x74, 0xF4, 
-  0x0C, 0x8C, 0x4C, 0xCC, 0x2C, 0xAC, 0x6C, 0xEC, 0x1C, 0x9C, 0x5C, 0xDC, 0x3C, 0xBC, 0x7C, 0xFC, 
-  0x02, 0x82, 0x42, 0xC2, 0x22, 0xA2, 0x62, 0xE2, 0x12, 0x92, 0x52, 0xD2, 0x32, 0xB2, 0x72, 0xF2, 
-  0x0A, 0x8A, 0x4A, 0xCA, 0x2A, 0xAA, 0x6A, 0xEA, 0x1A, 0x9A, 0x5A, 0xDA, 0x3A, 0xBA, 0x7A, 0xFA,
-  0x06, 0x86, 0x46, 0xC6, 0x26, 0xA6, 0x66, 0xE6, 0x16, 0x96, 0x56, 0xD6, 0x36, 0xB6, 0x76, 0xF6, 
-  0x0E, 0x8E, 0x4E, 0xCE, 0x2E, 0xAE, 0x6E, 0xEE, 0x1E, 0x9E, 0x5E, 0xDE, 0x3E, 0xBE, 0x7E, 0xFE,
-  0x01, 0x81, 0x41, 0xC1, 0x21, 0xA1, 0x61, 0xE1, 0x11, 0x91, 0x51, 0xD1, 0x31, 0xB1, 0x71, 0xF1,
-  0x09, 0x89, 0x49, 0xC9, 0x29, 0xA9, 0x69, 0xE9, 0x19, 0x99, 0x59, 0xD9, 0x39, 0xB9, 0x79, 0xF9, 
-  0x05, 0x85, 0x45, 0xC5, 0x25, 0xA5, 0x65, 0xE5, 0x15, 0x95, 0x55, 0xD5, 0x35, 0xB5, 0x75, 0xF5,
-  0x0D, 0x8D, 0x4D, 0xCD, 0x2D, 0xAD, 0x6D, 0xED, 0x1D, 0x9D, 0x5D, 0xDD, 0x3D, 0xBD, 0x7D, 0xFD,
-  0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3, 0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3, 
-  0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB, 0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB,
-  0x07, 0x87, 0x47, 0xC7, 0x27, 0xA7, 0x67, 0xE7, 0x17, 0x97, 0x57, 0xD7, 0x37, 0xB7, 0x77, 0xF7, 
-  0x0F, 0x8F, 0x4F, 0xCF, 0x2F, 0xAF, 0x6F, 0xEF, 0x1F, 0x9F, 0x5F, 0xDF, 0x3F, 0xBF, 0x7F, 0xFF
-};
-
-__device__
-unsigned long peano_hilbert_key(float x, float y, float z, int bits);
-
-__global__
-void find_boundaries(const int *pt_index,
-                     const int n,
-                     const int num_buckets,
-                           int *pt_tet_hash);
