@@ -1,6 +1,7 @@
 #include "structures.h"
 #include "predicates.h"
 
+// dummy function (will likely remove)
 __global__
 void remove_points(const int  size,
                          int *nominated,
