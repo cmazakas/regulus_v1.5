@@ -46,6 +46,9 @@ DAMAGE.
 
 #pragma once
 
+#include <limits.h>
+#include <float.h>
+
 enum DPredicateBounds
 {
     Splitter,       /* = 2^ceiling(p / 2) + 1.  Used to split floats in half. */
