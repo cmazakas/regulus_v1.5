@@ -1,90 +1,66 @@
 #include "structures.h"
 
-/*
-
-    In the paper, the author uses the following variables in their
-    Listing 4.1 : which_bucket, bucket_starts, num_keys, num_buckets
-
-    pt_index = which_bucket
-    pt_tet_hash = bucket_starts
-    n = num_keys
-    num_buckets is the same (number of buckets, duh!)
-
-    Bucket i starts at bucket_starts[i - 1] in bucket_contents
-    => bucket_contents[bucket_starts[i - 1]] is where bucket i
-    resides in the physical memory
-
-    By default, bucket 0 begins at 0 in bucket_contents
-    Final element of bucket_starts stores the length of the data (n)
-
-    This algorithm is predicated upon tet_index being sorted by pt_index
-*/
-
 __global__
-void find_boundaries(const int *pt_index,
-                     const int n,
-                     const int num_buckets,
-                           int *pt_tet_hash)
+void find_boundaries(const int  num_keys,
+                     const int  num_buckets,
+                     const int *which_bucket,
+                           int *bucket_starts)
 {
-    const int thread_num = threadIdx.x + blockIdx.x * blockDim.x;
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
-    for (int tid = thread_num; tid < n; tid += blockDim.x * gridDim.x)
+    for (int tid = thread_id; tid < num_keys; tid += bpg * tpb)
     {
-        const int prev = (tid > 0 ? pt_index[tid - 1] : 0);
-        const int curr = pt_index[tid];
+        // get start and end of each bucket
+        const int begin = (tid > 0 ? which_bucket[tid - 1] : 0);
+        const int end   = which_bucket[tid];
 
-        // If prev != curr, we've found a boundary 
-
-        if (prev != curr)
+        // if bucket has length > 0...
+        if (begin != end)
         {
-            for (int i = prev; i < curr; ++i)
+            for (int i = begin; i < end; ++i)
             {
-                pt_tet_hash[i] = tid;
+                // sets bucket starts value to index of bucket
+                bucket_starts[i] = tid;
             }
         }
 
-        // Final element 
-
-        if (tid == n - 1)
+        // last thread writes number of elements to the rest
+        // of the array
+        if (tid == num_keys - 1)
         {
-            for (int i = curr; i < num_buckets; ++i)
+            for (int i = end; i < num_buckets; ++i)
             {
-                pt_tet_hash[i] = n;
+                bucket_starts[i] = num_keys;
             }
         }
     }
 }
 
-/*
-__global__
-void find_boundaries(const int n, // size of pa, pa.size == ta.size
-                     const int nb, // number of buckets
-                     const int *pa, // index of bucket per ta value
-                           int *ht)
+hash_table::hash_table(const int                     Num_keys,
+                       const int                     Num_buckets,
+                       const thrust::device_ptr<int> Bucket_contents,
+                       const thrust::device_ptr<int> Which_bucket)
 {
-    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
+    num_keys        = Num_keys;
+    num_buckets     = Num_buckets;
+    bucket_contents = Bucket_contents;
+    which_bucket    = Which_bucket;
 
-    for (int i = tid; i < n; i += blockDim.x * gridDim.x)
-    {
-        const int prev = (i > 0 ? pa[i - 1] : 0);
-        const int curr = pa[i]; 
-
-        if (prev != curr)
-        {
-            for (int j = prev; j < curr; ++j)
-            {
-                ht[j] = i;
-            }
-        }
-
-        if (i == n - 1)
-        {
-            for (int j = curr; j < nb; ++j)
-            {
-                ht[j] = n;
-            }
-        }       
-    }   
+    bucket_starts = thrust::device_malloc<int>(num_buckets);
 }
-*/
 
+hash_table::~hash_table(void)
+{
+    thrust::device_free(bucket_starts);
+}
+
+void hash_table::build_table(void)
+{
+    find_boundaries<<<bpg, tpb>>>
+                   (num_keys,
+                    num_buckets,
+                    which_bucket.get(),
+                    bucket_starts.get());
+
+    cudaDeviceSynchronize();
+}
