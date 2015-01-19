@@ -1,101 +1,58 @@
 #include "structures.h"
 
-__global__
-void peanohash(point *p, unsigned long *table, int num_points);
-
-void mesh::create_input(const int box_length)
+void regulus::build_domain(const int box_length) // length of Cartesian grid
 {
-    num_points = box_length * box_length * box_length;
-    --num_points; // (0, 0, 0) is repeated (it's a root point)
-    num_tetrahedra = 1; // initial root tetrahedron
+    // cubic distribution + number of points for root tetrahedron
+    num_cartesian_points = box_length * box_length * box_length;
+    num_points           = num_cartesian_points + 4;
 
-    const int root_edge_length = 3 * (box_length - 1);
+    // allocate memory for points
+    points = thrust::device_malloc<point>(num_points);
 
+    // write Cartesian values to points
     {
-        const int pad = num_points + 4;
+        thrust::host_vector<point> tmp;
+        tmp.resize(num_cartesian_points);
 
-        point *tmp = 0;
-        cudaMallocHost(&tmp, pad * sizeof(*tmp));
-
-        // root points come first
-
-        new(tmp + 0) point(0, 0, 0);
-        new(tmp + 1) point(root_edge_length, 0, 0);
-        new(tmp + 2) point(0, root_edge_length, 0);
-        new(tmp + 3) point(0, 0, root_edge_length);
-
-        for (int i = 1; i < (num_points + 1); ++i) 
-        {
-            new(tmp + 3 + i) point(i / (box_length * box_length), (i / box_length) % box_length, i % box_length);
-            //tmp[3 + i].print();
+        for (int i = 0; i < num_cartesian_points; ++i)
+        { 
+            tmp[i] = point(i / (box_length * box_length), (i / box_length) % box_length, i % box_length);
         }
 
-        cudaMalloc(&points, pad * sizeof(*points));
-        cudaMemcpy(points, tmp, pad * sizeof(*points), cudaMemcpyHostToDevice);
+        /*cudaMemcpy(points + 4,
+                   thrust::raw_pointer_cast(tmp.data()),
+                   num_cart_points * sizeof(*points),
+                   cudaMemcpyHostToDevice);*/
 
-        cudaFreeHost(tmp);
+        thrust::copy(tmp.begin(), tmp.end(), points + 4);
+        cudaDeviceSynchronize();
     }
 
-    // Build root tetra
+    // write root points to buffer
+    const int root_edge_length = (box_length - 1) * 3;
 
-    tetrahedron t(0, 1, 2, 3);
-    cudaMalloc(&tetrahedra, 8 * num_points * sizeof(*tetrahedra));
-    cudaMemcpy(tetrahedra, &t, sizeof(t), cudaMemcpyHostToDevice);
+    points[0] = point(0, 0, 0);
+    points[1] = point(root_edge_length, 0, 0);
+    points[2] = point(0, root_edge_length, 0);
+    points[3] = point(0, 0, root_edge_length);
 
-    // Build adjacency relation table!
-    // These structures align perfectly with the mesh buffer
-    // and contain the adjacency information for the mesh
-    // Normally, this data is kept in the tetra structure
-    // but for performance reasons, it's a good idea to split
-    // them up as in gFlip
-
-    // Null-neighbours are noted by the index -1
-
-    adjacency_relations= 0;
-    cudaMalloc(&adjacency_relations, 8 * num_points * sizeof(*adjacency_relations));
-
-    {
-        adjacency_info *tmp = 0;
-        cudaMallocHost(&tmp, 8 * num_points * sizeof(*tmp));
-        for (int i = 0; i < 8 * num_points; ++i)
-            new(tmp + i) adjacency_info();
-        cudaMemcpy(adjacency_relations, tmp, 8 * num_points * sizeof(*adjacency_relations), cudaMemcpyHostToDevice);
-        cudaFreeHost(tmp);
-    }
-};
-
-void mesh::sort_by_peanokey(void)
-{
-    unsigned long *table = 0;
-
-    cudaMalloc(&table, num_points * sizeof(*table));
     
-    peanohash<<<bpg, tpb>>>(points, table, num_points);
-    thrust::sort_by_key(thrust::device_ptr<unsigned long>(table), thrust::device_ptr<unsigned long>(table + num_points), thrust::device_ptr<point>(points + 4));
-    cudaDeviceSynchronize();
-/*
+    // build root tetrahedron
+    mesh = thrust::device_malloc<tetrahedron>(8 * num_cartesian_points);
+    mesh[0] = tetrahedron(0, 1, 2, 3);
+    
+    // initially we only have 1 tetrahedron
+    num_tetra = 1;
+
+    // build adjacency relations
+    adj_relations = thrust::device_malloc<adjacency_info>(8 * num_cartesian_points);
+
+    // init adjacency relations
     {
-        printf("\nSorted point set : \n");
-        point *tmp = 0;
-        cudaMallocHost(&tmp, (num_points + 4) * sizeof(*tmp));
-        cudaMemcpy(tmp, points, (num_points + 4) * sizeof(*tmp), cudaMemcpyDeviceToHost);
-        for (int i = 0; i < num_points + 4; ++i)
-            tmp[i].print();
-        cudaFreeHost(tmp);
-    }
-*/
-    cudaFree(table);
-}
+        thrust::host_vector<adjacency_info> tmp;
+        tmp.resize(8 * num_cartesian_points);
 
-__global__
-void peanohash(point *p, unsigned long *table, const int n)
-{
-    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
-
-    for (int i = tid; i < n; i += blockDim.x * gridDim.x)
-    {
-        point tmp = p[4 + i];
-
-        table[i] =  peano_hilbert_key(tmp.x, tmp.y, tmp.z, 8 * sizeof(real));
+        thrust::copy(tmp.begin(), tmp.end(), adj_relations);
+        cudaDeviceSynchronize();
     }
 }
