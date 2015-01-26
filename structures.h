@@ -164,6 +164,7 @@ struct hash_table
     ~hash_table(void);
 
     void build_table(void);
+    void print(void);
 };
 
 struct regulus
