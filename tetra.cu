@@ -1,35 +1,65 @@
 #include "structures.h"
 #include "predicates.h"
 
-// dummy function (will likely remove)
 __global__
-void remove_points(const int  size,
-                         int *nominated,
-                         int *pa,
-                         int *ta,
-                         int *fs,
-                         int *la)
+void assert_no_flat_tetrahedra(const tetrahedron *mesh,
+                               const point       *points,
+                               const float       *predConsts,
+                               const int          num_tetra)
 {
     const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
-    for (int tid = thread_id; tid < size; tid += bpg * tpb)
+    for (int tid = thread_id; tid < num_tetra; tid += bpg * tpb)
     {
-        if (nominated[tid] == 1)
-        { printf("Removing point (tid = %d)\n", tid);
-            pa[tid] = -1;
-            ta[tid] = -1;
-            fs[tid] = -1;
-            la[tid] = -1;
-            
-            nominated[tid] = 0;
+        const tetrahedron t = mesh[tid];
+
+        const point a = points[t.v[0]];
+        const point b = points[t.v[1]];
+        const point c = points[t.v[2]];
+        const point d = points[t.v[3]];
+
+        const int ort0 = orientation(predConsts, d.p, c.p, b.p, a.p);
+        const int ort1 = orientation(predConsts, a.p, c.p, d.p, b.p);
+        const int ort2 = orientation(predConsts, a.p, d.p, b.p, c.p);
+        const int ort3 = orientation(predConsts, a.p, b.p, c.p, d.p);
+
+        const int ort = ort0 + ort1 + ort2 + ort3;
+
+        if (ort == 0)
+        {
+            assert(false && "Flat tetrahedron found!");
         }
     }
 }
 
 __global__
-void redistribution_cleanup(const int  fract_num_buckets,
-                            const int *ta_to_fl_bucket_starts,
-                            const int *tetra_bucket_starts,
+void remove_vertices(const int aa_capacity,
+                           int *pa,
+                           int *ta,
+                           int *fs,
+                           int *la,
+                           int *nominated)
+{
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    for (int tid = thread_id; tid < aa_capacity; tid += bpg * tpb)
+    {
+        const int loc = la[tid];
+
+        if (loc == 1 || loc == 2 || loc == 4 || loc == 8)
+        {
+            pa[tid] = ta[tid] = fs[tid] = la[tid] = -1;
+
+            nominated[tid] = 0;
+        }
+    }
+}
+                     
+
+__global__
+void redistribution_cleanup(const int  parent_to_fl_num_buckets,
+                            const int *parent_to_fl_bucket_starts,
+                            const int *ta_to_pa_bucket_starts,
                                   int *pa,
                                   int *ta,
                                   int *fs,
@@ -38,105 +68,170 @@ void redistribution_cleanup(const int  fract_num_buckets,
 {
     const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
 
-    for (int tid = thread_id; tid < fract_num_buckets; tid += bpg * tpb)
+    // one thread per parent_to_fl bucket...
+    for (int tid = thread_id; tid < parent_to_fl_num_buckets; tid += bpg * tpb)
     {
-        const int fract_begin = (tid > 0 ? ta_to_fl_bucket_starts[tid - 1] : 0);
-        const int fract_end   = ta_to_fl_bucket_starts[tid];
+        // get begin/end indices.
+        const int parent_to_fl_begin = (tid > 0 ? parent_to_fl_bucket_starts[tid - 1] : 0);
+        const int parent_to_fl_end   = parent_to_fl_bucket_starts[tid];
 
-        if (fract_end - fract_begin > 0)
+        // if the fracture bucket is non-empty, this tetrahedron
+        // was fractured...
+        if (parent_to_fl_end - parent_to_fl_begin > 0)
         {
-            const int tetra_begin = (tid > 0 ? tetra_bucket_starts[tid - 1] : 0);
-            const int tetra_end   = tetra_bucket_starts[tid];
+            const int ta_to_pa_begin = (tid > 0 ? ta_to_pa_bucket_starts[tid - 1] : 0);
+            const int ta_to_pa_end   = ta_to_pa_bucket_starts[tid];
 
-            for (int i = tetra_begin; i < tetra_end; ++i)
+            for (int i = ta_to_pa_begin; i < ta_to_pa_end; ++i)
             {
                 pa[i] = -1;
                 ta[i] = -1;
                 fs[i] = -1;
                 la[i] = -1;
+
+                nominated[i] = 0;
             }
         }
     }
 }
 
 __global__
-void calculate_point_info(const int          num_points,
-                          const tetrahedron *mesh,
-                          const tetrahedron *tet,
-                          const point       *points,
-                          const int         *pa_starts,
-                          const int         *nominated,
-                          const int          write_offset,
-                          const float       *predConsts,
-                                int         *pa,
-                                int         *ta,
-                                int         *fs,
-                                int         *la)
-{ 
-    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+void calculate_point_info(const int         num_points_per_bucket,
+                          const int        *pa_starts,
+                          const point      *points,
+                          const tetrahedron t,
+                          const float      *predConsts,
+                          const int         redist_offset_begin,
+                          const int         ta_id,
+                                int        *pa,
+                                int        *ta,
+                                int        *fs,
+                                int        *la)
+{
+    const int tid = threadIdx.x + blockIdx.x * blockDim.x;
 
-    // for each point in the buckets...
-    for (int tid = thread_id; tid < num_points; tid += bpg * tpb)
-    {
-        const int assoc_arr_id = pa_starts + tid - pa;
+    if (tid >= num_points_per_bucket)
+        return;
 
-        if (nominated[assoc_arr_id])
-        {
-            //printf("Point %d is nominated(%d), will later remove\n", pa_starts[tid], nominated[pa_starts[tid]]);
-            //points[pa_starts[tid]].print();
-            return;
-        }
+    //printf("%p\n%p\n%p\n%p\n%p\n%p\n%p\n%p\n%p\n%p\n%p\n", &num_points_per_bucket, pa_starts, points, &t, predConsts, &redist_offset_begin, &ta_id, pa, ta, fs, la);
 
-        // read in tetrahedron
-        const tetrahedron t = *tet;
+    const point p = points[pa_starts[tid]];
 
-        // read in points
-        const point a = points[t.v[0]];
-        const point b = points[t.v[1]];
-        const point c = points[t.v[2]];
-        const point d = points[t.v[3]];
+    const point a = points[t.v[0]];
+    const point b = points[t.v[1]];
+    const point c = points[t.v[2]];
+    const point d = points[t.v[3]];
 
-        const int point_id = pa_starts[tid];
+    // orienation of p vs every face
+    const int ort0 = orientation(predConsts, d.p, c.p, b.p, p.p); // 321
+    const int ort1 = orientation(predConsts, a.p, c.p, d.p, p.p); // 023
+    const int ort2 = orientation(predConsts, a.p, d.p, b.p, p.p); // 031
+    const int ort3 = orientation(predConsts, a.p, b.p, c.p, p.p); // 012
 
-        // read point
-        const point p = points[point_id];
+    // if point is outside tetrahedron...
+    if (ort0 < 0 || ort1 < 0 || ort2 < 0 || ort3 < 0)
+        return;
 
-        // orienation of p vs every face
-        const int ort0 = orientation(predConsts, d.p, c.p, b.p, p.p); // 321
-        const int ort1 = orientation(predConsts, a.p, c.p, d.p, p.p); // 023
-        const int ort2 = orientation(predConsts, a.p, d.p, b.p, p.p); // 031
-        const int ort3 = orientation(predConsts, a.p, b.p, c.p, p.p); // 012
+    // write location association
+    int loc = 0;
 
-        // if point is outside tetrahedron...
-        if (ort0 < 0 || ort1 < 0 || ort2 < 0 || ort3 < 0)
-            return;
-    
-        // write location association
-        int loc = 0;
+    loc |= (ort0 << 0);
+    loc |= (ort1 << 1);
+    loc |= (ort2 << 2);
+    loc |= (ort3 << 3);
 
-        loc |= (ort0 << 0);
-        loc |= (ort1 << 1);
-        loc |= (ort2 << 2);
-        loc |= (ort3 << 3);
+    const int fract_size = ort0 + ort1 + ort2 + ort3;
 
-        const int fract_size = ort0 + ort1 + ort2 + ort3;
+    if (fract_size == 0)
+        t.print();
 
-        const int curr_write_offset = write_offset + tid;
+    assert(fract_size > 0 && fract_size <= 4);
 
-        pa[curr_write_offset] = point_id;
-        ta[curr_write_offset] = tet - mesh;
-        la[curr_write_offset] = loc;
-        fs[curr_write_offset] = fract_size;
+    const int curr_write_offset = redist_offset_begin + tid;
 
-        //printf("New { pa, ta, la, fs } = { %d, %d, %d, %d }\n", pa[curr_write_offset], ta[curr_write_offset], la[curr_write_offset], fs[curr_write_offset]);
-    }
+    pa[curr_write_offset] = pa_starts[tid];
+    ta[curr_write_offset] = ta_id;
+    la[curr_write_offset] = loc;
+    fs[curr_write_offset] = fract_size;
 }
 
 __global__
+void redistribute_points(const int          parent_to_fl_num_buckets,
+                         const int         *parent_to_fl_bucket_starts,
+                         const int         *ta_to_pa_bucket_starts,
+                         const int         *parent_to_fl_bucket_contents,
+                         const int         *ta_to_pa_bucket_contents,
+                         const tetrahedron *mesh,
+                         const int          aa_size,
+                         const int         *redist_offsets,
+                         const float       *predConsts,
+                         const point       *points,
+                               int         *pa,
+                               int         *ta,
+                               int         *fs,
+                               int         *la)
+{
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // one thread per bucket in parent_to_fl
+    for (int tid = thread_id; tid < parent_to_fl_num_buckets; tid += bpg * tpb)
+    {
+        // get start/indices of parent_to_fl buckets
+        const int parent_to_fl_begin = (tid > 0 ? parent_to_fl_bucket_starts[tid - 1] : 0);
+        const int parent_to_fl_end   = parent_to_fl_bucket_starts[tid];
+
+        // if bucket is empty...
+        if (parent_to_fl_end - parent_to_fl_begin == 0)
+            return;
+
+        // get number of points associated with each tetrahedron
+        const int ta_to_pa_begin = (tid > 0 ? ta_to_pa_bucket_starts[tid - 1] : 0);
+        const int ta_to_pa_end   = ta_to_pa_bucket_starts[tid];
+        const int num_points_per_bucket = ta_to_pa_end - ta_to_pa_begin;
+
+        // assert that the bucket is not empty
+        assert(num_points_per_bucket > 0);
+
+        for (int i = parent_to_fl_begin;
+             i < parent_to_fl_end;
+             ++i)
+        {
+            // get tetrahedron in mesh
+            const int ta_id = parent_to_fl_bucket_contents[i];
+            const tetrahedron t = mesh[ta_id];
+            
+            // where point data starts...
+            const int *pa_starts = ta_to_pa_bucket_contents +
+                                   ta_to_pa_begin;
+
+            // get beginning offset for writing new info
+            const int redist_offset_begin = aa_size + 
+                                            redist_offsets[i];
+
+            const int blc = (num_points_per_bucket / tpb) + 
+                            (num_points_per_bucket % tpb == 0 ? 0 : 1);
+
+            calculate_point_info<<<blc , tpb>>>
+                                (num_points_per_bucket,
+                                 pa_starts,
+                                 points,
+                                 t,
+                                 predConsts,
+                                 redist_offset_begin,
+                                 ta_id,
+                                 pa,
+                                 ta,
+                                 fs,
+                                 la);
+        }
+    }
+}
+
+/*__global__
 void redistribute_points(const int          assoc_size,
                          const int          fract_num_buckets,
                          const int         *tetra_bucket_starts,
-                         const int         *ta_to_fl_bucket_starts, 
+                         const int         *parent_to_fl_bucket_starts, 
                          const int         *fl,
                          const int         *nominated,
                          const tetrahedron *mesh,
@@ -163,8 +258,8 @@ void redistribute_points(const int          assoc_size,
                                (tid > 0 ? tetra_bucket_starts[tid -1] : 0);
 
         // begin/end of bucket
-        const int begin = (tid > 0 ? ta_to_fl_bucket_starts[tid - 1] : 0);
-        const int end   = ta_to_fl_bucket_starts[tid];
+        const int begin = (tid > 0 ? parent_to_fl_bucket_starts[tid - 1] : 0);
+        const int end   = parent_to_fl_bucket_starts[tid];
 
         //const int off = (end - begin) * num_points;
         //printf("Proposed offsets in association arrays : %d\n", off);
@@ -194,6 +289,42 @@ void redistribute_points(const int          assoc_size,
                                  la);
         }
     }
+}*/
+
+__global__
+void get_redistribution_offsets(const int  parent_to_fl_num_buckets,
+                                const int *ta_to_pa_bucket_starts,
+                                const int *parent_to_fl_bucket_starts,
+                                      int *redist_offsets)
+{
+    const int thread_id = threadIdx.x + blockIdx.x * blockDim.x;
+
+    // one thread per bucket in parent_to_fl
+    for (int tid = thread_id; tid < parent_to_fl_num_buckets; tid += bpg * tpb)
+    {
+        // get the start/end of ta_to_pa buckets
+        const int ta_to_pa_begin = (tid > 0 ? 
+                                    ta_to_pa_bucket_starts[tid - 1] :
+                                    0);
+        const int ta_to_pa_end   = ta_to_pa_bucket_starts[tid];
+    
+        // number of points = difference in bucket starts...
+        const int num_points_per_bucket = ta_to_pa_end -
+                                          ta_to_pa_begin;
+
+        // get start and end indices of buckets in parent_to_fl
+        const int parent_to_fl_begin = (tid > 0 ?
+                                    parent_to_fl_bucket_starts[tid - 1] :
+                                    0);
+        const int parent_to_fl_end   = parent_to_fl_bucket_starts[tid];
+
+        // iterate to_to_fl bucket and write number of points in
+        // each associated ta_to_pa bucket
+        for (int i = parent_to_fl_begin; i < parent_to_fl_end; ++i)
+        {
+            redist_offsets[i] = num_points_per_bucket;
+        }
+    }
 }
 
 __global__
@@ -202,7 +333,7 @@ void fracture_tetrahedra(const int          nominated_size,
                          const int         *ta,
                          const int         *pa,
                          const int         *la,
-                         const int         *ta_to_fl_bucket_starts,
+                         const int         *parent_to_fl_bucket_starts,
                          const int         *fl,
                                tetrahedron *mesh)
 {
@@ -220,20 +351,20 @@ void fracture_tetrahedra(const int          nominated_size,
             const int pa_id = pa[tid];
 
             const int loc = la[tid];
-            
+//printf("location code = %d\n", loc);            
             const int faces[4][3] = { { 3, 2, 1 },   // face 0
                                       { 0, 2, 3 },   // face 1
                                       { 0, 3, 1 },   // face 2
                                       { 0, 1, 2 } }; // face 3
 
             // get start of bucket in fl 
-            int fract_bucket_loc = (ta_id > 0 ? ta_to_fl_bucket_starts[ta_id -1] : 0);
+            int fract_bucket_loc = (ta_id > 0 ? parent_to_fl_bucket_starts[ta_id -1] : 0);
 
             // iterate all possible faces
             for (int i = 0; i < 4; ++i)
             {
                 // if point p is above the half-space...
-                if (loc & (i << i))
+                if (loc & (1 << i))
                 {
                     const tetrahedron *tmp =
                     new(mesh + fl[fract_bucket_loc]) tetrahedron(t.v[faces[i][0]],
@@ -404,10 +535,32 @@ void get_fract_locations(associated_arrays               &aa,
 
     cudaDeviceSynchronize();
 
+    /**********************************/
+    /*std::cout << "Printing alpha sum" << std::endl;
+    for (thrust::device_vector<int>::size_type i = 0; 
+         i < alpha_sum.size(); 
+         ++i)
+    {
+        std::cout << alpha_sum[i] << " ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "Printing beta sum" << std::endl;
+    for (thrust::device_vector<int>::size_type i = 0; 
+         i < beta_sum.size(); 
+         ++i)
+    {
+        std::cout << beta_sum[i] << " ";
+    }
+    std::cout << std::endl;*/
+    /**********************************/
+
     // get total number of fracture addresses
     const int num_addresses = alpha_sum.back() + 
                               aa.nominated[aa.size - 1] * 
                               aa.fs[aa.size - 1];
+
+    //std::cout << "number of total addresses to write to " << num_addresses << std::endl;
 
     // allocate space for bucket contents
     // fl = fracture locations
@@ -431,6 +584,16 @@ void get_fract_locations(associated_arrays               &aa,
 
     cudaDeviceSynchronize();
 
+    /**********************************/
+    /*std::cout << "Printing fracture sites and associated tetra" << std::endl;
+    for (thrust::device_vector<int>::size_type i = 0; 
+         i < fl.size(); 
+         ++i)
+    {
+        std::cout << fl[i] << ", " << parent[i] << std::endl;
+    }*/
+    /**********************************/
+
     //for (int i = 0; i < fl.size(); ++i)
         //std::cout << fl[i] << " : " << parent[i] << std::endl;
 
@@ -451,6 +614,18 @@ void get_fract_locations(associated_arrays               &aa,
     parent_to_fl_table.build_table();
     ta_to_pa_table.build_table();
 
+    /**********************************/
+    /*std::cout << "parent_to_fl_table info" << std::endl;
+    parent_to_fl_table.print();
+    std::cout << std::endl;
+
+    std::cout << "ta_to_pa_table info" << std::endl;
+    ta_to_pa_table.print();
+    std::cout << std::endl;*/
+    /**********************************/
+
+    // allocate array to store offsets for redistribution
+    thrust::device_vector<int> redist_offsets(fl.size(), -1);
 
     const int arr_cap = aa.capacity;
 
@@ -467,16 +642,37 @@ void get_fract_locations(associated_arrays               &aa,
                         thrust::raw_pointer_cast(fl.data()),
                         mesh.get());
 
+    get_redistribution_offsets<<<bpg, tpb>>>
+                              (parent_to_fl_table.num_buckets,
+                               ta_to_pa_table.bucket_starts.get(),
+                               parent_to_fl_table.bucket_starts.get(),
+                               thrust::raw_pointer_cast(redist_offsets.data()));
+
+    thrust::exclusive_scan(redist_offsets.begin(),
+                           redist_offsets.end(),
+                           redist_offsets.begin());
+    cudaDeviceSynchronize();
+    /**********************************/
+    /*std::cout << "Redistribution offsets :" << std::endl;
+    for (thrust::device_vector<int>::size_type i = 0;
+         i < redist_offsets.size();
+         ++i)
+    {
+        std::cout << redist_offsets[i] << std::endl;
+    }*/
+    /**********************************/
+
     redistribute_points<<<bpg, tpb>>>
-                       (aa.size,
-                        parent_to_fl_table.num_buckets,
-                        ta_to_pa_table.bucket_starts.get(),
+                       (parent_to_fl_table.num_buckets,
                         parent_to_fl_table.bucket_starts.get(),
-                        thrust::raw_pointer_cast(fl.data()),
-                        aa.nominated.get(),
+                        ta_to_pa_table.bucket_starts.get(),
+                        parent_to_fl_table.bucket_contents.get(),
+                        ta_to_pa_table.bucket_contents.get(),
                         mesh.get(),
-                        points.get(),
+                        aa.size,
+                        thrust::raw_pointer_cast(redist_offsets.data()),
                         predConsts,
+                        points.get(),
                         aa.pa.get(),
                         aa.ta.get(),
                         aa.fs.get(),
@@ -492,6 +688,14 @@ void get_fract_locations(associated_arrays               &aa,
                            aa.la.get(),
                            aa.nominated.get());
 
+    remove_vertices<<<bpg, tpb>>>
+                   (arr_cap,
+                    aa.pa.get(),
+                    aa.ta.get(),
+                    aa.fs.get(),
+                    aa.la.get(),
+                    aa.nominated.get());
+
     thrust::sort(thrust::make_zip_iterator(
                     thrust::make_tuple(aa.ta,
                                        aa.pa,
@@ -506,7 +710,12 @@ void get_fract_locations(associated_arrays               &aa,
                                        aa.nominated + arr_cap)),
                  tuple_comp<int>());
 
-    iter     = thrust::find(aa.ta, aa.ta + arr_cap, -1);    
+    cudaDeviceSynchronize();    
+
+    iter = thrust::find(aa.ta, aa.ta + arr_cap, -1);
+
+    cudaDeviceSynchronize();    
+
     new_size = thrust::distance(aa.ta, iter); 
 
     cudaDeviceSynchronize();    
@@ -868,7 +1077,7 @@ void regulus::triangulate(void)
 
     while (aa.pa[0] != -1)
     {
-        std::cout << iteration++ << std::endl;
+        //std::cout << "Iteration " << ++iteration << std::endl;
 
         // Call routine to nominate points for insertion
         nominate_points(preds,
@@ -885,5 +1094,17 @@ void regulus::triangulate(void)
                             preds._consts);
     }
 
-    //aa.print_with_nominated();
+    assert_no_flat_tetrahedra<<<bpg, tpb>>>
+                             (mesh.get(),
+                              points.get(),
+                              preds._consts,
+                              num_tetra);
+    cudaDeviceSynchronize();
+
+    // Print out the final mesh
+    /*for (int i = 0; i < num_tetra; ++i)
+    {
+        const tetrahedron t = mesh[i];
+        t.print();
+    }*/
 }
