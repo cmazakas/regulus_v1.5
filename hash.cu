@@ -64,3 +64,25 @@ void hash_table::build_table(void)
 
     cudaDeviceSynchronize();
 }
+
+void hash_table::print(void)
+{
+    std::cout << "number of keys : " << num_keys << std::endl;
+    std::cout << "number of buckets : " << num_buckets << std::endl;
+
+    std::cout << "bucket_starts :" << std::endl;
+    for (int i = 0; i < num_buckets; ++i)
+    {
+        std::cout << "contents of bucket " << i << " :" << std::endl;
+
+        const int begin = (i > 0 ? bucket_starts[i - 1] : 0);
+        const int end   = bucket_starts[i];
+
+        std::cout << "end - begin = " << (end - begin) << std::endl;
+
+        for (int j = begin; j < end; ++j)
+        {
+            std::cout << bucket_contents[j] << std::endl;
+        }
+    }
+}
